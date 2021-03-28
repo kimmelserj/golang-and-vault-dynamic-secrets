@@ -1,0 +1,90 @@
+# Данный файл не даёт идемпотентный результат при выполнении команды `docker-compose up -d`.
+# При повторном запуске `docker-compose up -d` вы будет получать ошибки создания сущностей в Vault,
+# так как они там уже созданы первым запуском `docker-compose up -d`.
+# Чтобы добиться идемпотентности, нужно выполнять команду `docker-compose down -v && docker-compose up -d`.
+version: '3'
+services:
+  postgres:
+    image: "postgres:13.2-alpine"
+    environment:
+      POSTGRES_USER: "vault-root"
+      POSTGRES_PASSWORD: "vault-root-password"
+      POSTGRES_DB: "app-db"
+    ports:
+      - "5432:5432"
+
+  postgres-init:
+    image: "postgres:13.2-alpine"
+    restart: "on-failure:30"
+    command: 'psql -h postgres -U vault-root -c "CREATE ROLE app NOINHERIT; GRANT SELECT ON ALL TABLES IN SCHEMA pg_catalog TO \"app\";" app-db'
+    environment:
+      PGPASSWORD: "vault-root-password"
+    depends_on:
+      - postgres
+
+  vault:
+    image: "vault:1.7.0"
+    command: "server -dev -dev-root-token-id root"
+    ports:
+      - "8200:8200"
+
+  vault-init-enable-database-secrets-plugin:
+    image: "vault:1.7.0"
+    restart: "on-failure:30"
+    command: 'vault secrets enable database'
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    depends_on:
+      - vault
+
+  vault-init-create-database-config:
+    image: "vault:1.7.0"
+    restart: "on-failure:30"
+    command: 'vault write database/config/app-db plugin_name=postgresql-database-plugin connection_url="postgresql://{{username}}:{{password}}@postgres:5432/app-db?sslmode=disable" allowed_roles=app username="vault-root" password="vault-root-password"'
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    depends_on:
+      - vault-init-enable-database-secrets-plugin
+
+  # max_ttl намеренно не указан при создании роли, так как приложение может работать без перезапуска на протяжении нескольких месяцев.
+  # Иначе придётся учить приложение завершать свою работу при достижении max_ttl, что может быть очень непростой задачей.
+  vault-init-create-database-role:
+    image: "vault:1.7.0"
+    restart: "on-failure:30"
+    entrypoint: "vault"
+    command:
+      - write
+      - database/roles/app
+      - db_name=app-db
+      - creation_statements=CREATE ROLE "{{name}}" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' INHERIT; GRANT app TO "{{name}}";
+      - default_ttl=5m
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    depends_on:
+      - vault-init-create-database-config
+
+  vault-init-create-app-policy:
+    image: "vault:1.7.0"
+    restart: "on-failure:30"
+    working_dir: "/"
+    command: 'vault policy write app app-policy.hcl'
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    volumes:
+      - ".docker-compose/app-policy.hcl:/app-policy.hcl:ro"
+    depends_on:
+      - vault-init-create-database-role
+
+  vault-init-create-app-dev-token:
+    image: "vault:1.7.0"
+    restart: "on-failure:30"
+    command: 'vault token create -policy=app -id app-dev-token'
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    depends_on:
+      - vault-init-create-app-policy
