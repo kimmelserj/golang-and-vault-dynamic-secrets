@@ -32,6 +32,9 @@ func main() {
 
 	ctx := context.Background()
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	vaultClient, err := api.NewClient(api.DefaultConfig())
 	if err != nil {
 		panic(err)
@@ -46,7 +49,10 @@ func main() {
 			Отзыв секрета не является обязательной операцией, но лучше подчищать за собой.
 			Если приложение будет убито по SIGKILL, то Vault сам отзовёт секрет, когда истечёт TTL у секрета.
 		*/
-		_ = vaultClient.Sys().Revoke(dbSecret.LeaseID)
+		err := vaultClient.Sys().Revoke(dbSecret.LeaseID)
+		if err != nil {
+			log.Printf("Revoke error: %s", err.Error())
+		}
 	}()
 
 	/*
@@ -66,18 +72,20 @@ func main() {
 		for {
 			select {
 			case err := <-dbSecretRenewer.DoneCh():
+				/*
+					Если данный case выполняется, то это значит что что-то пошло не так при продлении аренды
+					и лучше что-то предпринять, так как Renewer завершил свою работу с ошибкой.
+					Здесь обязательно нужно дать понять приложению о том что не удалось продлить аренду.
+					Иначе приложение будет сыпать ошибками аутентификации при подключении к базе, пока его не перезапустят.
+				*/
 				if err != nil {
-					/*
-						Если данный if выполняется, то это значит что что-то пошло не так при продлении аренды
-						и лучше что-то предпринять, так как Renewer завершил свою работу с ошибкой.
-						Здесь обязательно нужно дать понять приложению о том что не удалось продлить аренду.
-						Иначе приложение будет сыпать ошибками аутентификации при подключении к базе, пока его не перезапустят.
-					*/
-					panic(err)
+					log.Printf("Secret renewer done error: %s", err.Error())
 				}
+				log.Printf("Secret renewer done")
+				sigChan <- syscall.SIGTERM
 
 			case renewal := <-dbSecretRenewer.RenewCh():
-				log.Printf("Database secret has been successfully renewed at %s\n", renewal.RenewedAt.Format(time.RFC3339))
+				log.Printf("Database secret has been renewed at %s\n", renewal.RenewedAt.Format(time.RFC3339))
 			}
 		}
 	}()
@@ -94,9 +102,6 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
