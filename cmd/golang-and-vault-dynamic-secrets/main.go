@@ -83,6 +83,7 @@ func main() {
 				}
 				log.Printf("Secret renewer done")
 				sigChan <- syscall.SIGTERM
+				return
 
 			case renewal := <-dbSecretRenewer.RenewCh():
 				log.Printf("Database secret has been renewed at %s\n", renewal.RenewedAt.Format(time.RFC3339))
